@@ -1,0 +1,14 @@
+# Compiled binaries
+*.exe
+*.out
+*.o
+*.obj
+
+# Runtime banking data
+accounts.txt
+transactions.txt
+
+# IDE files
+.vscode/
+.idea/
+*.code-workspace
