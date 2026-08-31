@@ -1,335 +1,358 @@
-#include <iostream>
-#include <fstream>
-#include <vector>
-#include <string>
-#include <iomanip>
-#include <limits>
-#include <ctime>
-#include <sstream>
 #include <algorithm>
+#include <chrono>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
+#include <iostream>
+#include <limits>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 using namespace std;
 
-class Account {
+namespace util {
+string trim(string value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == string::npos) return {};
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+string now() {
+    const auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
+    tm local{};
+#ifdef _WIN32
+    localtime_s(&local, &t);
+#else
+    localtime_r(&t, &local);
+#endif
+    ostringstream out;
+    out << put_time(&local, "%Y-%m-%d %H:%M:%S");
+    return out.str();
+}
+
+bool validPin(const string& pin) {
+    return pin.size() == 4 && all_of(pin.begin(), pin.end(), [](unsigned char c) {
+        return std::isdigit(c) != 0;
+    });
+}
+}
+
+class Money {
 public:
-    long long accountNumber;
+    static constexpr long long SCALE = 100;
+    long long cents{};
+
+    static optional<Money> fromDouble(double value) {
+        if (!isfinite(value) || value <= 0) return nullopt;
+        return Money{static_cast<long long>(llround(value * SCALE))};
+    }
+
+    string str() const {
+        ostringstream out;
+        out << fixed << setprecision(2) << (static_cast<double>(cents) / SCALE);
+        return out.str();
+    }
+};
+
+struct Account {
+    long long number{};
     string name;
     string phone;
     string address;
-    string pin;
-    double balance;
-
-    Account() : accountNumber(0), balance(0.0) {}
-    Account(long long number, const string& name, const string& phone,
-            const string& address, const string& pin, double balance = 0.0)
-        : accountNumber(number), name(name), phone(phone), address(address), pin(pin), balance(balance) {}
+    string pin; // Demo project only. Production systems should use a salted password hash.
+    long long balanceCents{};
+    bool frozen{false};
+    int failedAttempts{0};
 };
 
 class Bank {
-private:
     vector<Account> accounts;
+    mutable mutex dataMutex;
     const string accountsFile = "accounts.txt";
     const string transactionsFile = "transactions.txt";
+    static constexpr int MAX_FAILED_ATTEMPTS = 3;
 
-    Account* findAccount(long long number) {
-        for (auto& account : accounts)
-            if (account.accountNumber == number) return &account;
+    Account* findUnlocked(long long number) {
+        for (auto& a : accounts) if (a.number == number) return &a;
         return nullptr;
     }
 
-    bool accountExists(long long number) const {
-        for (const auto& account : accounts)
-            if (account.accountNumber == number) return true;
-        return false;
+    const Account* findUnlocked(long long number) const {
+        for (const auto& a : accounts) if (a.number == number) return &a;
+        return nullptr;
     }
 
-    string currentDateTime() const {
-        time_t now = time(nullptr);
-        tm* local = localtime(&now);
-        char buffer[32];
-        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", local);
-        return buffer;
-    }
-
-    void recordTransaction(long long accountNumber, const string& type,
-                           double amount, double balanceAfter, const string& note = "") const {
+    void audit(const string& type, long long account, long long amount, const string& note) const {
         ofstream file(transactionsFile, ios::app);
         if (!file) return;
-        file << currentDateTime() << "|" << accountNumber << "|" << type << "|"
-             << fixed << setprecision(2) << amount << "|" << balanceAfter << "|" << note << "\n";
+        file << util::now() << '|' << account << '|' << type << '|'
+             << Money{amount}.str() << '|' << note << '\n';
     }
 
-    bool readAmount(double& amount) const {
-        cin >> amount;
-        if (cin.fail() || amount <= 0) {
+    static void line() { cout << string(58, '-') << '\n'; }
+
+    optional<long long> readAmountCents() const {
+        double value;
+        cin >> value;
+        if (cin.fail()) {
             cin.clear();
             cin.ignore(numeric_limits<streamsize>::max(), '\n');
-            cout << "Invalid amount.\n";
-            return false;
+            return nullopt;
         }
-        return true;
+        auto money = Money::fromDouble(value);
+        return money ? optional<long long>(money->cents) : nullopt;
     }
 
-    bool authenticate(Account*& account) {
+    Account* authenticate() {
         long long number;
         string pin;
         cout << "Account Number: ";
         cin >> number;
         cout << "PIN: ";
         cin >> pin;
-        account = findAccount(number);
-        if (!account || account->pin != pin) {
-            cout << "Invalid account number or PIN.\n";
-            account = nullptr;
-            return false;
+
+        Account* account = findUnlocked(number);
+        if (!account || account->frozen) {
+            cout << "Invalid or frozen account.\n";
+            return nullptr;
         }
-        return true;
+        if (account->pin != pin) {
+            ++account->failedAttempts;
+            if (account->failedAttempts >= MAX_FAILED_ATTEMPTS) account->frozen = true;
+            cout << "Invalid PIN. Attempts: " << account->failedAttempts << '/' << MAX_FAILED_ATTEMPTS << '\n';
+            if (account->frozen) cout << "Account has been frozen after too many failed attempts.\n";
+            return nullptr;
+        }
+        account->failedAttempts = 0;
+        return account;
     }
 
 public:
-    Bank() { loadAccounts(); }
+    Bank() { load(); }
 
-    void loadAccounts() {
+    void load() {
+        lock_guard lock(dataMutex);
         accounts.clear();
         ifstream file(accountsFile);
         if (!file) return;
-
-        Account account;
-        while (file >> account.accountNumber) {
+        Account a;
+        int frozen = 0;
+        while (file >> a.number) {
             file.ignore(numeric_limits<streamsize>::max(), '\n');
-            getline(file, account.name);
-            getline(file, account.phone);
-            getline(file, account.address);
-            getline(file, account.pin);
-            file >> account.balance;
+            getline(file, a.name);
+            getline(file, a.phone);
+            getline(file, a.address);
+            getline(file, a.pin);
+            file >> a.balanceCents >> frozen >> a.failedAttempts;
             file.ignore(numeric_limits<streamsize>::max(), '\n');
-            accounts.push_back(account);
+            a.frozen = frozen != 0;
+            accounts.push_back(a);
         }
     }
 
-    void saveAccounts() const {
-        ofstream file(accountsFile);
-        for (const auto& account : accounts) {
-            file << account.accountNumber << '\n'
-                 << account.name << '\n'
-                 << account.phone << '\n'
-                 << account.address << '\n'
-                 << account.pin << '\n'
-                 << fixed << setprecision(2) << account.balance << '\n';
+    void save() const {
+        lock_guard lock(dataMutex);
+        ofstream file(accountsFile, ios::trunc);
+        if (!file) throw runtime_error("Unable to save accounts file");
+        for (const auto& a : accounts) {
+            file << a.number << '\n' << a.name << '\n' << a.phone << '\n' << a.address << '\n'
+                 << a.pin << '\n' << a.balanceCents << ' ' << a.frozen << ' ' << a.failedAttempts << '\n';
         }
     }
 
     void createAccount() {
+        lock_guard lock(dataMutex);
         long long number;
-        string name, phone, address, pin;
-        double initialDeposit;
-
-        cout << "\n========== CREATE ACCOUNT ==========\n";
-        cout << "Account Number: ";
+        string pin;
+        Account a;
+        cout << "\n========== CREATE ACCOUNT ==========\nAccount Number: ";
         cin >> number;
-        if (accountExists(number)) {
-            cout << "Account number already exists.\n";
-            return;
-        }
+        if (findUnlocked(number)) { cout << "Account already exists.\n"; return; }
+        a.number = number;
         cin.ignore(numeric_limits<streamsize>::max(), '\n');
-        cout << "Full Name: "; getline(cin, name);
-        cout << "Phone: "; getline(cin, phone);
-        cout << "Address: "; getline(cin, address);
+        cout << "Full Name: "; getline(cin, a.name);
+        cout << "Phone: "; getline(cin, a.phone);
+        cout << "Address: "; getline(cin, a.address);
         cout << "Create 4-digit PIN: "; cin >> pin;
-        if (pin.size() != 4 || !all_of(pin.begin(), pin.end(), ::isdigit)) {
-            cout << "PIN must contain exactly 4 digits.\n";
-            return;
-        }
+        if (!util::validPin(pin)) { cout << "PIN must contain exactly 4 digits.\n"; return; }
+        a.pin = pin;
         cout << "Initial Deposit: ";
-        if (!readAmount(initialDeposit)) return;
+        auto amount = readAmountCents();
+        if (!amount) { cout << "Invalid amount.\n"; return; }
+        a.balanceCents = *amount;
+        accounts.push_back(a);
+        ofstream tx(transactionsFile, ios::app);
+        if (tx) tx << util::now() << '|' << a.number << "|CREATE|" << Money{a.balanceCents}.str() << "|Initial deposit\n";
+        saveUnlocked();
+        cout << "Account created successfully.\n";
+    }
 
-        accounts.emplace_back(number, name, phone, address, pin, initialDeposit);
-        saveAccounts();
-        recordTransaction(number, "CREATE", initialDeposit, initialDeposit, "Initial deposit");
-        cout << "Account created successfully!\n";
+    void saveUnlocked() const {
+        ofstream file(accountsFile, ios::trunc);
+        if (!file) throw runtime_error("Unable to save accounts file");
+        for (const auto& a : accounts) {
+            file << a.number << '\n' << a.name << '\n' << a.phone << '\n' << a.address << '\n'
+                 << a.pin << '\n' << a.balanceCents << ' ' << a.frozen << ' ' << a.failedAttempts << '\n';
+        }
     }
 
     void deposit() {
-        Account* account;
+        lock_guard lock(dataMutex);
         cout << "\n========== DEPOSIT ==========\n";
-        if (!authenticate(account)) return;
-        double amount;
-        cout << "Amount: ";
-        if (!readAmount(amount)) return;
-        account->balance += amount;
-        saveAccounts();
-        recordTransaction(account->accountNumber, "DEPOSIT", amount, account->balance);
-        cout << "Deposit successful. New balance: $" << fixed << setprecision(2) << account->balance << '\n';
+        Account* a = authenticate(); if (!a) return;
+        cout << "Amount: "; auto amount = readAmountCents();
+        if (!amount) { cout << "Invalid amount.\n"; return; }
+        a->balanceCents += *amount;
+        audit("DEPOSIT", a->number, *amount, "Cash deposit");
+        saveUnlocked();
+        cout << "Deposit successful. Balance: $" << Money{a->balanceCents}.str() << '\n';
     }
 
     void withdraw() {
-        Account* account;
+        lock_guard lock(dataMutex);
         cout << "\n========== WITHDRAW ==========\n";
-        if (!authenticate(account)) return;
-        double amount;
-        cout << "Amount: ";
-        if (!readAmount(amount)) return;
-        if (amount > account->balance) {
-            cout << "Insufficient balance.\n";
-            return;
-        }
-        account->balance -= amount;
-        saveAccounts();
-        recordTransaction(account->accountNumber, "WITHDRAW", amount, account->balance);
-        cout << "Withdrawal successful. New balance: $" << fixed << setprecision(2) << account->balance << '\n';
-    }
-
-    void checkBalance() {
-        Account* account;
-        cout << "\n========== BALANCE ==========\n";
-        if (!authenticate(account)) return;
-        cout << "Available Balance: $" << fixed << setprecision(2) << account->balance << '\n';
-    }
-
-    void showAccountInfo() {
-        Account* account;
-        cout << "\n========== ACCOUNT INFORMATION ==========\n";
-        if (!authenticate(account)) return;
-        cout << "Account Number : " << account->accountNumber << '\n'
-             << "Name           : " << account->name << '\n'
-             << "Phone          : " << account->phone << '\n'
-             << "Address        : " << account->address << '\n'
-             << "Balance        : $" << fixed << setprecision(2) << account->balance << '\n';
+        Account* a = authenticate(); if (!a) return;
+        cout << "Amount: "; auto amount = readAmountCents();
+        if (!amount) { cout << "Invalid amount.\n"; return; }
+        if (*amount > a->balanceCents) { cout << "Insufficient balance.\n"; return; }
+        a->balanceCents -= *amount;
+        audit("WITHDRAW", a->number, *amount, "Cash withdrawal");
+        saveUnlocked();
+        cout << "Withdrawal successful. Balance: $" << Money{a->balanceCents}.str() << '\n';
     }
 
     void transfer() {
-        Account* sender;
-        cout << "\n========== MONEY TRANSFER ==========\n";
-        if (!authenticate(sender)) return;
-
+        lock_guard lock(dataMutex);
+        cout << "\n========== TRANSFER ==========\n";
+        Account* sender = authenticate(); if (!sender) return;
         long long receiverNumber;
-        double amount;
         cout << "Receiver Account Number: "; cin >> receiverNumber;
-        Account* receiver = findAccount(receiverNumber);
-        if (!receiver) { cout << "Receiver account not found.\n"; return; }
-        if (receiver == sender) { cout << "You cannot transfer to the same account.\n"; return; }
-        cout << "Amount: ";
-        if (!readAmount(amount)) return;
-        if (amount > sender->balance) { cout << "Insufficient balance.\n"; return; }
-
-        sender->balance -= amount;
-        receiver->balance += amount;
-        saveAccounts();
-        recordTransaction(sender->accountNumber, "TRANSFER_OUT", amount, sender->balance, "To " + to_string(receiver->accountNumber));
-        recordTransaction(receiver->accountNumber, "TRANSFER_IN", amount, receiver->balance, "From " + to_string(sender->accountNumber));
+        Account* receiver = findUnlocked(receiverNumber);
+        if (!receiver || receiver->frozen) { cout << "Receiver unavailable.\n"; return; }
+        if (receiver == sender) { cout << "Cannot transfer to the same account.\n"; return; }
+        cout << "Amount: "; auto amount = readAmountCents();
+        if (!amount || *amount > sender->balanceCents) { cout << "Invalid amount or insufficient balance.\n"; return; }
+        sender->balanceCents -= *amount;
+        receiver->balanceCents += *amount;
+        audit("TRANSFER_OUT", sender->number, *amount, "To " + to_string(receiver->number));
+        audit("TRANSFER_IN", receiver->number, *amount, "From " + to_string(sender->number));
+        saveUnlocked();
         cout << "Transfer completed successfully.\n";
     }
 
-    void updateAccount() {
-        Account* account;
-        cout << "\n========== UPDATE ACCOUNT ==========\n";
-        if (!authenticate(account)) return;
-        cin.ignore(numeric_limits<streamsize>::max(), '\n');
-        cout << "New Phone: "; getline(cin, account->phone);
-        cout << "New Address: "; getline(cin, account->address);
-        saveAccounts();
-        cout << "Account updated successfully.\n";
+    void accountInfo() {
+        lock_guard lock(dataMutex);
+        cout << "\n========== ACCOUNT INFORMATION ==========\n";
+        Account* a = authenticate(); if (!a) return;
+        line();
+        cout << "Account Number : " << a->number << '\n'
+             << "Name           : " << a->name << '\n'
+             << "Phone          : " << a->phone << '\n'
+             << "Address        : " << a->address << '\n'
+             << "Status         : " << (a->frozen ? "FROZEN" : "ACTIVE") << '\n'
+             << "Balance        : $" << Money{a->balanceCents}.str() << '\n';
     }
 
-    void deleteAccount() {
-        Account* account;
-        cout << "\n========== DELETE ACCOUNT ==========\n";
-        if (!authenticate(account)) return;
-        if (account->balance != 0) {
-            cout << "Account can only be deleted when balance is $0.00.\n";
-            return;
-        }
-        long long number = account->accountNumber;
-        accounts.erase(remove_if(accounts.begin(), accounts.end(),
-                                 [number](const Account& a) { return a.accountNumber == number; }), accounts.end());
-        saveAccounts();
-        recordTransaction(number, "DELETE", 0, 0, "Account deleted");
-        cout << "Account deleted successfully.\n";
-    }
-
-    void transactionHistory() const {
-        long long number;
-        string pin;
+    void history() {
+        lock_guard lock(dataMutex);
         cout << "\n========== TRANSACTION HISTORY ==========\n";
-        cout << "Account Number: "; cin >> number;
-        cout << "PIN: "; cin >> pin;
-        bool valid = false;
-        for (const auto& account : accounts)
-            if (account.accountNumber == number && account.pin == pin) valid = true;
-        if (!valid) { cout << "Invalid account number or PIN.\n"; return; }
-
+        Account* a = authenticate(); if (!a) return;
         ifstream file(transactionsFile);
-        if (!file) { cout << "No transactions found.\n"; return; }
-        string line;
-        bool found = false;
-        while (getline(file, line)) {
-            stringstream ss(line);
-            string date, acc, type, amount, balance, note;
-            getline(ss, date, '|'); getline(ss, acc, '|'); getline(ss, type, '|');
-            getline(ss, amount, '|'); getline(ss, balance, '|'); getline(ss, note);
-            if (acc == to_string(number)) {
-                cout << date << " | " << type << " | Amount: " << amount
-                     << " | Balance: " << balance;
-                if (!note.empty()) cout << " | " << note;
-                cout << '\n';
+        if (!file) { cout << "No transaction history.\n"; return; }
+        string lineText; bool found = false;
+        while (getline(file, lineText)) {
+            stringstream ss(lineText);
+            string date, id, type, amount, note;
+            getline(ss, date, '|'); getline(ss, id, '|'); getline(ss, type, '|'); getline(ss, amount, '|'); getline(ss, note);
+            if (id == to_string(a->number)) {
+                cout << date << " | " << type << " | $" << amount << " | " << note << '\n';
                 found = true;
             }
         }
-        if (!found) cout << "No transactions found for this account.\n";
+        if (!found) cout << "No transactions found.\n";
+    }
+
+    void updateAccount() {
+        lock_guard lock(dataMutex);
+        cout << "\n========== UPDATE ACCOUNT ==========\n";
+        Account* a = authenticate(); if (!a) return;
+        cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        cout << "New Phone: "; getline(cin, a->phone);
+        cout << "New Address: "; getline(cin, a->address);
+        saveUnlocked();
+        cout << "Account updated.\n";
+    }
+
+    void freezeAccount() {
+        lock_guard lock(dataMutex);
+        cout << "\n========== FREEZE / UNFREEZE ==========\n";
+        long long number; string pin;
+        cout << "Account Number: "; cin >> number;
+        Account* a = findUnlocked(number);
+        if (!a) { cout << "Account not found.\n"; return; }
+        cout << "PIN: "; cin >> pin;
+        if (a->pin != pin) { cout << "Invalid PIN.\n"; return; }
+        a->frozen = !a->frozen;
+        a->failedAttempts = 0;
+        audit(a->frozen ? "FREEZE" : "UNFREEZE", a->number, 0, "Account status changed");
+        saveUnlocked();
+        cout << (a->frozen ? "Account frozen.\n" : "Account unfrozen.\n");
     }
 
     void statistics() const {
-        double total = 0;
-        for (const auto& account : accounts) total += account.balance;
+        lock_guard lock(dataMutex);
+        long long total = 0; size_t frozen = 0;
+        for (const auto& a : accounts) { total += a.balanceCents; frozen += a.frozen; }
         cout << "\n========== BANK STATISTICS ==========\n"
-             << "Total Accounts : " << accounts.size() << '\n'
-             << "Total Deposits : $" << fixed << setprecision(2) << total << '\n';
+             << "Accounts       : " << accounts.size() << '\n'
+             << "Active         : " << accounts.size() - frozen << '\n'
+             << "Frozen         : " << frozen << '\n'
+             << "Total Deposits : $" << Money{total}.str() << '\n';
     }
 };
 
 int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
     Bank bank;
-    int choice;
-
     while (true) {
-        cout << "\n===============================================\n"
-             << "          PROFESSIONAL BANK SYSTEM\n"
-             << "===============================================\n"
-             << "1. Create Account\n"
-             << "2. Deposit Money\n"
-             << "3. Withdraw Money\n"
-             << "4. Check Balance\n"
-             << "5. Money Transfer\n"
-             << "6. Account Information\n"
-             << "7. Transaction History\n"
-             << "8. Update Account\n"
-             << "9. Delete Account\n"
-             << "10. Bank Statistics\n"
-             << "11. Exit\n"
-             << "===============================================\n"
-             << "Choice: ";
-
+        cout << "\n====================================================\n"
+             << "           PROFESSIONAL BANK SYSTEM 2026\n"
+             << "====================================================\n"
+             << "1. Create Account\n2. Deposit\n3. Withdraw\n4. Check Balance\n"
+             << "5. Money Transfer\n6. Account Information\n7. Transaction History\n"
+             << "8. Update Account\n9. Freeze/Unfreeze Account\n10. Statistics\n11. Exit\n"
+             << "====================================================\nChoice: ";
+        int choice;
         cin >> choice;
         if (cin.fail()) {
-            cin.clear();
-            cin.ignore(numeric_limits<streamsize>::max(), '\n');
-            cout << "Invalid input.\n";
-            continue;
+            cin.clear(); cin.ignore(numeric_limits<streamsize>::max(), '\n');
+            cout << "Invalid choice.\n"; continue;
         }
-
-        switch (choice) {
-            case 1: bank.createAccount(); break;
-            case 2: bank.deposit(); break;
-            case 3: bank.withdraw(); break;
-            case 4: bank.checkBalance(); break;
-            case 5: bank.transfer(); break;
-            case 6: bank.showAccountInfo(); break;
-            case 7: bank.transactionHistory(); break;
-            case 8: bank.updateAccount(); break;
-            case 9: bank.deleteAccount(); break;
-            case 10: bank.statistics(); break;
-            case 11: cout << "Thank you for using Professional Bank System!\n"; return 0;
-            default: cout << "Invalid choice. Please try again.\n";
+        try {
+            switch (choice) {
+                case 1: bank.createAccount(); break;
+                case 2: bank.deposit(); break;
+                case 3: bank.withdraw(); break;
+                case 4: { bank.accountInfo(); break; }
+                case 5: bank.transfer(); break;
+                case 6: bank.accountInfo(); break;
+                case 7: bank.history(); break;
+                case 8: bank.updateAccount(); break;
+                case 9: bank.freezeAccount(); break;
+                case 10: bank.statistics(); break;
+                case 11: cout << "Goodbye!\n"; return 0;
+                default: cout << "Invalid choice.\n";
+            }
+        } catch (const exception& e) {
+            cerr << "Operation failed: " << e.what() << '\n';
         }
     }
 }
