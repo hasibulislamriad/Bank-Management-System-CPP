@@ -1,358 +1,233 @@
+#include <sqlite3.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+
 #include <algorithm>
-#include <chrono>
-#include <cctype>
-#include <filesystem>
-#include <fstream>
 #include <iomanip>
 #include <iostream>
-#include <limits>
-#include <mutex>
-#include <optional>
-#include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <vector>
+#include <cctype>
+#include <limits>
 
 using namespace std;
 
-namespace util {
-string trim(string value) {
-    const auto first = value.find_first_not_of(" \t\r\n");
-    if (first == string::npos) return {};
-    const auto last = value.find_last_not_of(" \t\r\n");
-    return value.substr(first, last - first + 1);
-}
+class Db {
+    sqlite3* db_ = nullptr;
 
-string now() {
-    const auto t = chrono::system_clock::to_time_t(chrono::system_clock::now());
-    tm local{};
-#ifdef _WIN32
-    localtime_s(&local, &t);
-#else
-    localtime_r(&t, &local);
-#endif
+    static void check(int rc, sqlite3* db, const string& action) {
+        if (rc != SQLITE_OK && rc != SQLITE_DONE && rc != SQLITE_ROW)
+            throw runtime_error(action + ": " + sqlite3_errmsg(db));
+    }
+
+public:
+    explicit Db(const string& path = "bank.db") {
+        check(sqlite3_open(path.c_str(), &db_), db_, "open database");
+        sqlite3_exec(db_, "PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+        const char* schema = R"SQL(
+CREATE TABLE IF NOT EXISTS accounts(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ account_number TEXT NOT NULL UNIQUE,
+ name TEXT NOT NULL,
+ phone TEXT NOT NULL DEFAULT '',
+ address TEXT NOT NULL DEFAULT '',
+ pin_hash TEXT NOT NULL,
+ balance_cents INTEGER NOT NULL DEFAULT 0 CHECK(balance_cents >= 0),
+ frozen INTEGER NOT NULL DEFAULT 0,
+ failed_attempts INTEGER NOT NULL DEFAULT 0,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS transactions(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ account_id INTEGER NOT NULL,
+ type TEXT NOT NULL,
+ amount_cents INTEGER NOT NULL CHECK(amount_cents >= 0),
+ balance_after_cents INTEGER NOT NULL CHECK(balance_after_cents >= 0),
+ reference TEXT,
+ note TEXT,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+CREATE TABLE IF NOT EXISTS audit_logs(
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ account_id INTEGER,
+ action TEXT NOT NULL,
+ details TEXT,
+ created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+ FOREIGN KEY(account_id) REFERENCES accounts(id)
+);
+CREATE INDEX IF NOT EXISTS idx_accounts_number ON accounts(account_number);
+CREATE INDEX IF NOT EXISTS idx_transactions_account ON transactions(account_id);
+)SQL";
+        check(sqlite3_exec(db_, schema, nullptr, nullptr, nullptr), db_, "create schema");
+    }
+
+    ~Db() { if (db_) sqlite3_close(db_); }
+    sqlite3* raw() { return db_; }
+
+    void begin() { check(sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr), db_, "begin transaction"); }
+    void commit() { check(sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, nullptr), db_, "commit transaction"); }
+    void rollback() { sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr); }
+};
+
+static string hex(const unsigned char* data, size_t n) {
     ostringstream out;
-    out << put_time(&local, "%Y-%m-%d %H:%M:%S");
+    out << hex << setfill('0');
+    for (size_t i = 0; i < n; ++i) out << setw(2) << static_cast<int>(data[i]);
     return out.str();
 }
 
-bool validPin(const string& pin) {
-    return pin.size() == 4 && all_of(pin.begin(), pin.end(), [](unsigned char c) {
-        return std::isdigit(c) != 0;
-    });
-}
-}
-
-class Money {
-public:
-    static constexpr long long SCALE = 100;
-    long long cents{};
-
-    static optional<Money> fromDouble(double value) {
-        if (!isfinite(value) || value <= 0) return nullopt;
-        return Money{static_cast<long long>(llround(value * SCALE))};
+static vector<unsigned char> unhex(const string& s) {
+    if (s.size() % 2) throw runtime_error("Invalid hash encoding");
+    vector<unsigned char> out(s.size() / 2);
+    for (size_t i = 0; i < out.size(); ++i) {
+        unsigned int v;
+        string byte = s.substr(i * 2, 2);
+        stringstream ss; ss << std::hex << byte; ss >> v;
+        out[i] = static_cast<unsigned char>(v);
     }
+    return out;
+}
 
-    string str() const {
-        ostringstream out;
-        out << fixed << setprecision(2) << (static_cast<double>(cents) / SCALE);
-        return out.str();
+// PBKDF2-HMAC-SHA256 with a random 16-byte salt.
+// For real production banking, prefer a dedicated password KDF such as Argon2id.
+static string hashPin(const string& pin) {
+    constexpr int iterations = 200000;
+    unsigned char salt[16], digest[32];
+    if (RAND_bytes(salt, sizeof salt) != 1)
+        throw runtime_error("Unable to generate secure salt");
+    if (PKCS5_PBKDF2_HMAC(pin.c_str(), static_cast<int>(pin.size()), salt, sizeof salt,
+                         iterations, EVP_sha256(), sizeof digest, digest) != 1)
+        throw runtime_error("PIN hashing failed");
+    return "pbkdf2-sha256$" + to_string(iterations) + "$" + hex(salt, sizeof salt) + "$" + hex(digest, sizeof digest);
+}
+
+static bool verifyPin(const string& pin, const string& stored) {
+    const string prefix = "pbkdf2-sha256$";
+    if (stored.rfind(prefix, 0) != 0) return false;
+    vector<string> parts; string part; stringstream ss(stored);
+    while (getline(ss, part, '$')) parts.push_back(part);
+    if (parts.size() != 4) return false;
+    int iterations = stoi(parts[1]);
+    auto salt = unhex(parts[2]);
+    auto expected = unhex(parts[3]);
+    vector<unsigned char> actual(expected.size());
+    return PKCS5_PBKDF2_HMAC(pin.c_str(), static_cast<int>(pin.size()), salt.data(), static_cast<int>(salt.size()),
+                             iterations, EVP_sha256(), static_cast<int>(actual.size()), actual.data()) == 1 &&
+           CRYPTO_memcmp(actual.data(), expected.data(), expected.size()) == 0;
+}
+
+static bool validPin(const string& p) {
+    return p.size() == 4 && all_of(p.begin(), p.end(), [](unsigned char c){ return isdigit(c); });
+}
+
+static long long amount() {
+    double value; cin >> value;
+    if (cin.fail() || !isfinite(value) || value <= 0) {
+        cin.clear(); cin.ignore(numeric_limits<streamsize>::max(), '\n');
+        throw runtime_error("Invalid amount");
     }
-};
+    return llround(value * 100.0);
+}
 
-struct Account {
-    long long number{};
-    string name;
-    string phone;
-    string address;
-    string pin; // Demo project only. Production systems should use a salted password hash.
-    long long balanceCents{};
-    bool frozen{false};
-    int failedAttempts{0};
-};
+static string money(long long cents) {
+    ostringstream out; out << fixed << setprecision(2) << cents / 100.0; return out.str();
+}
+
+static void bindText(sqlite3_stmt* s, int i, const string& v) { sqlite3_bind_text(s, i, v.c_str(), -1, SQLITE_TRANSIENT); }
 
 class Bank {
-    vector<Account> accounts;
-    mutable mutex dataMutex;
-    const string accountsFile = "accounts.txt";
-    const string transactionsFile = "transactions.txt";
-    static constexpr int MAX_FAILED_ATTEMPTS = 3;
+    Db db;
+    static constexpr int MAX_ATTEMPTS = 3;
 
-    Account* findUnlocked(long long number) {
-        for (auto& a : accounts) if (a.number == number) return &a;
-        return nullptr;
+    sqlite3_stmt* prepare(const char* sql) {
+        sqlite3_stmt* s = nullptr;
+        if (sqlite3_prepare_v2(db.raw(), sql, -1, &s, nullptr) != SQLITE_OK)
+            throw runtime_error(sqlite3_errmsg(db.raw()));
+        return s;
     }
 
-    const Account* findUnlocked(long long number) const {
-        for (const auto& a : accounts) if (a.number == number) return &a;
-        return nullptr;
+    void audit(long long accountId, const string& action, const string& details) {
+        sqlite3_stmt* s = prepare("INSERT INTO audit_logs(account_id,action,details) VALUES(?,?,?)");
+        sqlite3_bind_int64(s, 1, accountId); bindText(s, 2, action); bindText(s, 3, details);
+        sqlite3_step(s); sqlite3_finalize(s);
     }
 
-    void audit(const string& type, long long account, long long amount, const string& note) const {
-        ofstream file(transactionsFile, ios::app);
-        if (!file) return;
-        file << util::now() << '|' << account << '|' << type << '|'
-             << Money{amount}.str() << '|' << note << '\n';
-    }
-
-    static void line() { cout << string(58, '-') << '\n'; }
-
-    optional<long long> readAmountCents() const {
-        double value;
-        cin >> value;
-        if (cin.fail()) {
-            cin.clear();
-            cin.ignore(numeric_limits<streamsize>::max(), '\n');
-            return nullopt;
+    bool account(const string& number, long long& id, string& hash, long long& balance, int& frozen, int& attempts) {
+        sqlite3_stmt* s = prepare("SELECT id,pin_hash,balance_cents,frozen,failed_attempts FROM accounts WHERE account_number=?");
+        bindText(s, 1, number); bool found = false;
+        if (sqlite3_step(s) == SQLITE_ROW) {
+            found = true; id = sqlite3_column_int64(s,0); hash = reinterpret_cast<const char*>(sqlite3_column_text(s,1));
+            balance = sqlite3_column_int64(s,2); frozen = sqlite3_column_int(s,3); attempts = sqlite3_column_int(s,4);
         }
-        auto money = Money::fromDouble(value);
-        return money ? optional<long long>(money->cents) : nullopt;
+        sqlite3_finalize(s); return found;
     }
 
-    Account* authenticate() {
-        long long number;
-        string pin;
-        cout << "Account Number: ";
-        cin >> number;
-        cout << "PIN: ";
-        cin >> pin;
+    bool auth(const string& number, const string& pin, long long& id, long long& balance) {
+        string hash; int frozen, attempts;
+        if (!account(number,id,hash,balance,frozen,attempts) || frozen) return false;
+        if (!verifyPin(pin, hash)) {
+            ++attempts; int nowFrozen = attempts >= MAX_ATTEMPTS;
+            sqlite3_stmt* s = prepare("UPDATE accounts SET failed_attempts=?, frozen=?, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+            sqlite3_bind_int(s,1,attempts); sqlite3_bind_int(s,2,nowFrozen); sqlite3_bind_int64(s,3,id); sqlite3_step(s); sqlite3_finalize(s);
+            cout << "Invalid PIN. Attempts: " << attempts << '/' << MAX_ATTEMPTS << '\n';
+            if (nowFrozen) cout << "Account frozen after too many failed attempts.\n";
+            return false;
+        }
+        sqlite3_stmt* s = prepare("UPDATE accounts SET failed_attempts=0, updated_at=CURRENT_TIMESTAMP WHERE id=?");
+        sqlite3_bind_int64(s,1,id); sqlite3_step(s); sqlite3_finalize(s); return true;
+    }
 
-        Account* account = findUnlocked(number);
-        if (!account || account->frozen) {
-            cout << "Invalid or frozen account.\n";
-            return nullptr;
-        }
-        if (account->pin != pin) {
-            ++account->failedAttempts;
-            if (account->failedAttempts >= MAX_FAILED_ATTEMPTS) account->frozen = true;
-            cout << "Invalid PIN. Attempts: " << account->failedAttempts << '/' << MAX_FAILED_ATTEMPTS << '\n';
-            if (account->frozen) cout << "Account has been frozen after too many failed attempts.\n";
-            return nullptr;
-        }
-        account->failedAttempts = 0;
-        return account;
+    void recordTx(long long accountId, const string& type, long long amountCents, long long balanceAfter, const string& note) {
+        sqlite3_stmt* s = prepare("INSERT INTO transactions(account_id,type,amount_cents,balance_after_cents,note) VALUES(?,?,?,?,?)");
+        sqlite3_bind_int64(s,1,accountId); bindText(s,2,type); sqlite3_bind_int64(s,3,amountCents); sqlite3_bind_int64(s,4,balanceAfter); bindText(s,5,note);
+        sqlite3_step(s); sqlite3_finalize(s);
     }
 
 public:
-    Bank() { load(); }
-
-    void load() {
-        lock_guard lock(dataMutex);
-        accounts.clear();
-        ifstream file(accountsFile);
-        if (!file) return;
-        Account a;
-        int frozen = 0;
-        while (file >> a.number) {
-            file.ignore(numeric_limits<streamsize>::max(), '\n');
-            getline(file, a.name);
-            getline(file, a.phone);
-            getline(file, a.address);
-            getline(file, a.pin);
-            file >> a.balanceCents >> frozen >> a.failedAttempts;
-            file.ignore(numeric_limits<streamsize>::max(), '\n');
-            a.frozen = frozen != 0;
-            accounts.push_back(a);
-        }
-    }
-
-    void save() const {
-        lock_guard lock(dataMutex);
-        ofstream file(accountsFile, ios::trunc);
-        if (!file) throw runtime_error("Unable to save accounts file");
-        for (const auto& a : accounts) {
-            file << a.number << '\n' << a.name << '\n' << a.phone << '\n' << a.address << '\n'
-                 << a.pin << '\n' << a.balanceCents << ' ' << a.frozen << ' ' << a.failedAttempts << '\n';
-        }
-    }
-
-    void createAccount() {
-        lock_guard lock(dataMutex);
-        long long number;
-        string pin;
-        Account a;
-        cout << "\n========== CREATE ACCOUNT ==========\nAccount Number: ";
-        cin >> number;
-        if (findUnlocked(number)) { cout << "Account already exists.\n"; return; }
-        a.number = number;
-        cin.ignore(numeric_limits<streamsize>::max(), '\n');
-        cout << "Full Name: "; getline(cin, a.name);
-        cout << "Phone: "; getline(cin, a.phone);
-        cout << "Address: "; getline(cin, a.address);
+    void create() {
+        string number,name,phone,address,pin;
+        cout << "Account Number: "; cin >> number; cin.ignore(numeric_limits<streamsize>::max(),'\n');
+        cout << "Full Name: "; getline(cin,name); cout << "Phone: "; getline(cin,phone); cout << "Address: "; getline(cin,address);
         cout << "Create 4-digit PIN: "; cin >> pin;
-        if (!util::validPin(pin)) { cout << "PIN must contain exactly 4 digits.\n"; return; }
-        a.pin = pin;
-        cout << "Initial Deposit: ";
-        auto amount = readAmountCents();
-        if (!amount) { cout << "Invalid amount.\n"; return; }
-        a.balanceCents = *amount;
-        accounts.push_back(a);
-        ofstream tx(transactionsFile, ios::app);
-        if (tx) tx << util::now() << '|' << a.number << "|CREATE|" << Money{a.balanceCents}.str() << "|Initial deposit\n";
-        saveUnlocked();
-        cout << "Account created successfully.\n";
-    }
-
-    void saveUnlocked() const {
-        ofstream file(accountsFile, ios::trunc);
-        if (!file) throw runtime_error("Unable to save accounts file");
-        for (const auto& a : accounts) {
-            file << a.number << '\n' << a.name << '\n' << a.phone << '\n' << a.address << '\n'
-                 << a.pin << '\n' << a.balanceCents << ' ' << a.frozen << ' ' << a.failedAttempts << '\n';
-        }
+        if (!validPin(pin)) throw runtime_error("PIN must contain exactly 4 digits");
+        cout << "Initial Deposit: "; long long cents = amount();
+        sqlite3_stmt* s = prepare("INSERT INTO accounts(account_number,name,phone,address,pin_hash,balance_cents) VALUES(?,?,?,?,?,?)");
+        bindText(s,1,number); bindText(s,2,name); bindText(s,3,phone); bindText(s,4,address); bindText(s,5,hashPin(pin)); sqlite3_bind_int64(s,6,cents);
+        if (sqlite3_step(s) != SQLITE_DONE) { string e=sqlite3_errmsg(db.raw()); sqlite3_finalize(s); throw runtime_error("Account creation failed: "+e); }
+        long long id=sqlite3_last_insert_rowid(db.raw()); sqlite3_finalize(s); recordTx(id,"CREATE",cents,cents,"Initial deposit"); audit(id,"ACCOUNT_CREATED","Account created");
+        cout << "Account created.\n";
     }
 
     void deposit() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== DEPOSIT ==========\n";
-        Account* a = authenticate(); if (!a) return;
-        cout << "Amount: "; auto amount = readAmountCents();
-        if (!amount) { cout << "Invalid amount.\n"; return; }
-        a->balanceCents += *amount;
-        audit("DEPOSIT", a->number, *amount, "Cash deposit");
-        saveUnlocked();
-        cout << "Deposit successful. Balance: $" << Money{a->balanceCents}.str() << '\n';
+        string n,p; cout << "Account Number: "; cin>>n; cout<<"PIN: ";cin>>p; long long id,balance;
+        if(!auth(n,p,id,balance)){cout<<"Authentication failed.\n";return;} cout<<"Amount: "; auto a=amount();
+        db.begin(); try { balance+=a; sqlite3_stmt*s=prepare("UPDATE accounts SET balance_cents=?,updated_at=CURRENT_TIMESTAMP WHERE id=?");sqlite3_bind_int64(s,1,balance);sqlite3_bind_int64(s,2,id);sqlite3_step(s);sqlite3_finalize(s);recordTx(id,"DEPOSIT",a,balance,"Cash deposit");audit(id,"DEPOSIT","Amount "+money(a));db.commit();cout<<"Balance: $"<<money(balance)<<'\n'; } catch(...) {db.rollback();throw;}
     }
 
     void withdraw() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== WITHDRAW ==========\n";
-        Account* a = authenticate(); if (!a) return;
-        cout << "Amount: "; auto amount = readAmountCents();
-        if (!amount) { cout << "Invalid amount.\n"; return; }
-        if (*amount > a->balanceCents) { cout << "Insufficient balance.\n"; return; }
-        a->balanceCents -= *amount;
-        audit("WITHDRAW", a->number, *amount, "Cash withdrawal");
-        saveUnlocked();
-        cout << "Withdrawal successful. Balance: $" << Money{a->balanceCents}.str() << '\n';
+        string n,p; cout<<"Account Number: ";cin>>n;cout<<"PIN: ";cin>>p;long long id,balance;
+        if(!auth(n,p,id,balance)){cout<<"Authentication failed.\n";return;}cout<<"Amount: ";auto a=amount();if(a>balance){cout<<"Insufficient balance.\n";return;}
+        db.begin();try{balance-=a;sqlite3_stmt*s=prepare("UPDATE accounts SET balance_cents=?,updated_at=CURRENT_TIMESTAMP WHERE id=?");sqlite3_bind_int64(s,1,balance);sqlite3_bind_int64(s,2,id);sqlite3_step(s);sqlite3_finalize(s);recordTx(id,"WITHDRAW",a,balance,"Cash withdrawal");audit(id,"WITHDRAW","Amount "+money(a));db.commit();cout<<"Balance: $"<<money(balance)<<'\n';}catch(...){db.rollback();throw;}
     }
 
     void transfer() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== TRANSFER ==========\n";
-        Account* sender = authenticate(); if (!sender) return;
-        long long receiverNumber;
-        cout << "Receiver Account Number: "; cin >> receiverNumber;
-        Account* receiver = findUnlocked(receiverNumber);
-        if (!receiver || receiver->frozen) { cout << "Receiver unavailable.\n"; return; }
-        if (receiver == sender) { cout << "Cannot transfer to the same account.\n"; return; }
-        cout << "Amount: "; auto amount = readAmountCents();
-        if (!amount || *amount > sender->balanceCents) { cout << "Invalid amount or insufficient balance.\n"; return; }
-        sender->balanceCents -= *amount;
-        receiver->balanceCents += *amount;
-        audit("TRANSFER_OUT", sender->number, *amount, "To " + to_string(receiver->number));
-        audit("TRANSFER_IN", receiver->number, *amount, "From " + to_string(sender->number));
-        saveUnlocked();
-        cout << "Transfer completed successfully.\n";
+        string from,p,to;cout<<"Sender Account: ";cin>>from;cout<<"PIN: ";cin>>p;long long sid,sbal;if(!auth(from,p,sid,sbal)){cout<<"Authentication failed.\n";return;}cout<<"Receiver Account: ";cin>>to;long long rid,rbal;string rh;int rf,ra;if(!account(to,rid,rh,rbal,rf,ra)||rf){cout<<"Receiver unavailable.\n";return;}if(sid==rid){cout<<"Cannot transfer to same account.\n";return;}cout<<"Amount: ";auto a=amount();if(a>sbal){cout<<"Insufficient balance.\n";return;}
+        db.begin();try{sbal-=a;rbal+=a;sqlite3_stmt*s=prepare("UPDATE accounts SET balance_cents=?,updated_at=CURRENT_TIMESTAMP WHERE id=?");sqlite3_bind_int64(s,1,sbal);sqlite3_bind_int64(s,2,sid);sqlite3_step(s);sqlite3_reset(s);sqlite3_bind_int64(s,1,rbal);sqlite3_bind_int64(s,2,rid);sqlite3_step(s);sqlite3_finalize(s);recordTx(sid,"TRANSFER_OUT",a,sbal,"To "+to);recordTx(rid,"TRANSFER_IN",a,rbal,"From "+from);audit(sid,"TRANSFER_OUT","To "+to+" amount "+money(a));audit(rid,"TRANSFER_IN","From "+from+" amount "+money(a));db.commit();cout<<"Transfer completed.\n";}catch(...){db.rollback();throw;}
     }
 
-    void accountInfo() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== ACCOUNT INFORMATION ==========\n";
-        Account* a = authenticate(); if (!a) return;
-        line();
-        cout << "Account Number : " << a->number << '\n'
-             << "Name           : " << a->name << '\n'
-             << "Phone          : " << a->phone << '\n'
-             << "Address        : " << a->address << '\n'
-             << "Status         : " << (a->frozen ? "FROZEN" : "ACTIVE") << '\n'
-             << "Balance        : $" << Money{a->balanceCents}.str() << '\n';
+    void info() {
+        string n,p;cout<<"Account Number: ";cin>>n;cout<<"PIN: ";cin>>p;long long id,b; if(!auth(n,p,id,b)){cout<<"Authentication failed.\n";return;}
+        sqlite3_stmt*s=prepare("SELECT name,phone,address,frozen,balance_cents FROM accounts WHERE id=?");sqlite3_bind_int64(s,1,id);if(sqlite3_step(s)==SQLITE_ROW){cout<<"Name: "<<sqlite3_column_text(s,0)<<"\nPhone: "<<sqlite3_column_text(s,1)<<"\nAddress: "<<sqlite3_column_text(s,2)<<"\nStatus: "<<(sqlite3_column_int(s,3)?"FROZEN":"ACTIVE")<<"\nBalance: $"<<money(sqlite3_column_int64(s,4))<<"\n";}sqlite3_finalize(s);
     }
 
     void history() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== TRANSACTION HISTORY ==========\n";
-        Account* a = authenticate(); if (!a) return;
-        ifstream file(transactionsFile);
-        if (!file) { cout << "No transaction history.\n"; return; }
-        string lineText; bool found = false;
-        while (getline(file, lineText)) {
-            stringstream ss(lineText);
-            string date, id, type, amount, note;
-            getline(ss, date, '|'); getline(ss, id, '|'); getline(ss, type, '|'); getline(ss, amount, '|'); getline(ss, note);
-            if (id == to_string(a->number)) {
-                cout << date << " | " << type << " | $" << amount << " | " << note << '\n';
-                found = true;
-            }
-        }
-        if (!found) cout << "No transactions found.\n";
-    }
-
-    void updateAccount() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== UPDATE ACCOUNT ==========\n";
-        Account* a = authenticate(); if (!a) return;
-        cin.ignore(numeric_limits<streamsize>::max(), '\n');
-        cout << "New Phone: "; getline(cin, a->phone);
-        cout << "New Address: "; getline(cin, a->address);
-        saveUnlocked();
-        cout << "Account updated.\n";
-    }
-
-    void freezeAccount() {
-        lock_guard lock(dataMutex);
-        cout << "\n========== FREEZE / UNFREEZE ==========\n";
-        long long number; string pin;
-        cout << "Account Number: "; cin >> number;
-        Account* a = findUnlocked(number);
-        if (!a) { cout << "Account not found.\n"; return; }
-        cout << "PIN: "; cin >> pin;
-        if (a->pin != pin) { cout << "Invalid PIN.\n"; return; }
-        a->frozen = !a->frozen;
-        a->failedAttempts = 0;
-        audit(a->frozen ? "FREEZE" : "UNFREEZE", a->number, 0, "Account status changed");
-        saveUnlocked();
-        cout << (a->frozen ? "Account frozen.\n" : "Account unfrozen.\n");
-    }
-
-    void statistics() const {
-        lock_guard lock(dataMutex);
-        long long total = 0; size_t frozen = 0;
-        for (const auto& a : accounts) { total += a.balanceCents; frozen += a.frozen; }
-        cout << "\n========== BANK STATISTICS ==========\n"
-             << "Accounts       : " << accounts.size() << '\n'
-             << "Active         : " << accounts.size() - frozen << '\n'
-             << "Frozen         : " << frozen << '\n'
-             << "Total Deposits : $" << Money{total}.str() << '\n';
+        string n,p;cout<<"Account Number: ";cin>>n;cout<<"PIN: ";cin>>p;long long id,b;if(!auth(n,p,id,b)){cout<<"Authentication failed.\n";return;}
+        sqlite3_stmt*s=prepare("SELECT created_at,type,amount_cents,balance_after_cents,note FROM transactions WHERE account_id=? ORDER BY id DESC");sqlite3_bind_int64(s,1,id);while(sqlite3_step(s)==SQLITE_ROW)cout<<sqlite3_column_text(s,0)<<" | "<<sqlite3_column_text(s,1)<<" | $"<<money(sqlite3_column_int64(s,2))<<" | balance $"<<money(sqlite3_column_int64(s,3))<<" | "<<sqlite3_column_text(s,4)<<'\n';sqlite3_finalize(s);
     }
 };
 
-int main() {
-    ios::sync_with_stdio(false);
-    cin.tie(nullptr);
-    Bank bank;
-    while (true) {
-        cout << "\n====================================================\n"
-             << "           PROFESSIONAL BANK SYSTEM 2026\n"
-             << "====================================================\n"
-             << "1. Create Account\n2. Deposit\n3. Withdraw\n4. Check Balance\n"
-             << "5. Money Transfer\n6. Account Information\n7. Transaction History\n"
-             << "8. Update Account\n9. Freeze/Unfreeze Account\n10. Statistics\n11. Exit\n"
-             << "====================================================\nChoice: ";
-        int choice;
-        cin >> choice;
-        if (cin.fail()) {
-            cin.clear(); cin.ignore(numeric_limits<streamsize>::max(), '\n');
-            cout << "Invalid choice.\n"; continue;
-        }
-        try {
-            switch (choice) {
-                case 1: bank.createAccount(); break;
-                case 2: bank.deposit(); break;
-                case 3: bank.withdraw(); break;
-                case 4: { bank.accountInfo(); break; }
-                case 5: bank.transfer(); break;
-                case 6: bank.accountInfo(); break;
-                case 7: bank.history(); break;
-                case 8: bank.updateAccount(); break;
-                case 9: bank.freezeAccount(); break;
-                case 10: bank.statistics(); break;
-                case 11: cout << "Goodbye!\n"; return 0;
-                default: cout << "Invalid choice.\n";
-            }
-        } catch (const exception& e) {
-            cerr << "Operation failed: " << e.what() << '\n';
-        }
-    }
-}
+int main(){ios::sync_with_stdio(false);cin.tie(nullptr);Bank bank;while(true){cout<<"\n==============================================\n PROFESSIONAL BANK SYSTEM 2026\n==============================================\n1. Create Account\n2. Deposit\n3. Withdraw\n4. Transfer\n5. Account Information\n6. Transaction History\n7. Exit\nChoice: ";int c;if(!(cin>>c)){cin.clear();cin.ignore(numeric_limits<streamsize>::max(),'\n');continue;}try{switch(c){case 1:bank.create();break;case 2:bank.deposit();break;case 3:bank.withdraw();break;case 4:bank.transfer();break;case 5:bank.info();break;case 6:bank.history();break;case 7:return 0;default:cout<<"Invalid choice.\n";}}catch(const exception&e){cerr<<"Error: "<<e.what()<<'\n';}}}
