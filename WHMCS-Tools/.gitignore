@@ -1,4 +1,0 @@
-*.log
-.env
-.env.*
-config.local.php
