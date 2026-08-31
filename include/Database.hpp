@@ -1,7 +1,7 @@
 #pragma once
 #include <sqlite3.h>
+#include <stdexcept>
 #include <string>
-#include <utility>
 
 namespace bank {
 class Statement {
@@ -14,7 +14,7 @@ public:
     ~Statement() { if (stmt_) sqlite3_finalize(stmt_); }
     Statement(const Statement&) = delete;
     Statement& operator=(const Statement&) = delete;
-    sqlite3_stmt* get() const { return stmt_; }
+    sqlite3_stmt* get() const noexcept { return stmt_; }
 };
 
 class Transaction {
