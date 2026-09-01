@@ -1,0 +1,14 @@
+{
+  "listeners": [
+    {
+      "address": "0.0.0.0",
+      "port": 8080,
+      "https": false
+    }
+  ],
+  "app": {
+    "document_root": "./public",
+    "threads_num": 4,
+    "client_max_body_size": 1048576
+  }
+}
